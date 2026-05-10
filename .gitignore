@@ -1,0 +1,15 @@
+.env
+google-creds.json
+*.json
+!**/sample.json
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.idea/
+.vscode/
+
+attachments/
+*.log
