@@ -1,5 +1,5 @@
 aiogram==3.13.1
-openai==1.54.4
+openai>=1.55,<2
 gspread==6.1.4
 google-auth==2.35.0
 aiosmtplib==3.0.2

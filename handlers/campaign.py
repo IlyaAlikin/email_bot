@@ -267,9 +267,10 @@ async def confirm_go(
 
     _cleanup_attachments(attachments)
 
+    source_label = "CSV" if isinstance(sheets, CSVSource) else "Google Sheets"
     await progress_msg.edit_text(
         f"🏁 <b>Готово</b>\nВсего: {total}\n✅ Успешно: {sent}\n❌ Ошибок: {failed}\n\n"
-        "Статус каждой строки записан в Google Sheets (колонки last_sent_at, last_status)."
+        f"Статус каждой строки записан в {source_label} (колонки last_sent_at, last_status)."
     )
     await state.clear()
 
