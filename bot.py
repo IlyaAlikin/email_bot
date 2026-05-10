@@ -6,6 +6,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats
 
 from config import load_settings
 from handlers import campaign, start
@@ -71,7 +72,19 @@ async def main() -> None:
 
     log.info("Bot is starting. Whitelisted admins: %s", sorted(settings.admin_ids))
     await bot.delete_webhook(drop_pending_updates=True)
+    await _set_bot_commands(bot)
     await dp.start_polling(bot)
+
+
+async def _set_bot_commands(bot: Bot) -> None:
+    commands = [
+        BotCommand(command="new", description="Новая рассылка"),
+        BotCommand(command="cancel", description="Отменить черновик"),
+        BotCommand(command="skip", description="Пропустить шаг (на этапе вложений)"),
+        BotCommand(command="whoami", description="Мой Telegram ID"),
+        BotCommand(command="start", description="Приветствие и помощь"),
+    ]
+    await bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
 
 
 if __name__ == "__main__":

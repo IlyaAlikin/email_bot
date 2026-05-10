@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 import uuid
 from pathlib import Path
 
@@ -35,6 +36,8 @@ class Campaign(StatesGroup):
     waiting_brief = State()
     waiting_attachments = State()
     waiting_confirm = State()
+    editing_brief = State()
+    editing_body = State()
 
 
 @router.message(Command("new"))
@@ -44,7 +47,7 @@ async def cmd_new(message: Message, state: FSMContext) -> None:
     await message.answer(
         "📨 <b>Новая рассылка — шаг 1/4</b>\n\n"
         "Введи <b>тему письма</b> (Subject). Это то, что увидит клиент в ящике до открытия.\n\n"
-        "Например: <i>Летняя коллекция Estelle: −20% до конца недели</i>"
+        "Например: <i>Оптовая печать: −20% до конца недели</i>"
     )
 
 
@@ -63,8 +66,9 @@ async def step_subject(message: Message, state: FSMContext) -> None:
         "✏️ <b>Шаг 2/4 — бриф для GPT</b>\n\n"
         "Опиши <b>что должно быть в письме</b>: повод, оффер, дедлайн, нужный тон.\n"
         "GPT адаптирует это под каждого клиента (имя, доп. поля из таблицы).\n\n"
-        "Например: <i>Анонс летней коллекции, скидка 20% по промокоду SUMMER до 31 июля. "
-        "Тон тёплый, обращение на «вы». Подписать как «команда Estelle».</i>"
+        "Например: <i>Предложение по оптовой печати визиток, листовок и баннеров. "
+        "Скидка 20% на первый заказ при оформлении до конца месяца. "
+        "Тон деловой, обращение на «вы». Подписать как «команда типографии Форвард-С».</i>"
     )
 
 
@@ -137,11 +141,6 @@ async def _go_to_confirm(
     gpt: GPTPersonalizer,
     **_: object,
 ) -> None:
-    data = await state.get_data()
-    subject = data["subject"]
-    brief = data["brief"]
-    attachments = data.get("attachments", [])
-
     progress = await message.answer("⏳ Тяну базу клиентов из Google Sheets…")
 
     try:
@@ -167,37 +166,88 @@ async def _go_to_confirm(
         await state.clear()
         return
 
-    await progress.edit_text(
-        f"✅ Найдено получателей: <b>{len(active)}</b>"
-        + (f" (отписалось: {len(recipients) - len(active)})" if len(active) != len(recipients) else "")
-        + "\n\n⏳ Генерирую превью на первом клиенте…"
+    sample = active[0]
+    await state.update_data(
+        total=len(active),
+        unsubscribed_count=len(recipients) - len(active),
+        sample_email=sample.email,
+        sample_name=sample.name,
+        sample_extra=sample.extra,
+    )
+    await state.set_state(Campaign.waiting_confirm)
+    await _render_preview(progress, state, gpt, edit=True)
+
+
+async def _render_preview(
+    message: Message,
+    state: FSMContext,
+    gpt: GPTPersonalizer,
+    *,
+    edit: bool,
+    note: str = "",
+) -> None:
+    """Build preview for the first recipient and show confirm keyboard.
+
+    edit=True → редактировать переданное сообщение; edit=False → отправить новое.
+    """
+    data = await state.get_data()
+    subject: str = data["subject"]
+    brief: str = data["brief"]
+    manual_body: str | None = data.get("manual_body")
+    attachments = data.get("attachments", [])
+    total: int = data["total"]
+    unsubscribed_count: int = data.get("unsubscribed_count", 0)
+
+    sample = Recipient(
+        row_index=0,
+        email=data["sample_email"],
+        name=data["sample_name"],
+        extra=dict(data.get("sample_extra") or {}),
     )
 
-    sample = active[0]
-    try:
-        preview_body = await gpt.generate_body(subject=subject, brief=brief, recipient=sample)
-    except Exception as exc:
-        log.exception("GPT preview failed")
-        await progress.edit_text(
-            f"❌ GPT вернул ошибку при генерации превью:\n<code>{html.escape(str(exc))}</code>"
-        )
-        await state.clear()
-        return
+    progress_text = "⏳ Генерирую превью на первом клиенте…"
+    if edit:
+        try:
+            await message.edit_text(progress_text)
+        except Exception:
+            pass
 
-    await state.update_data(total=len(active))
-    await state.set_state(Campaign.waiting_confirm)
+    if manual_body is not None:
+        body = _safe_format(manual_body, _recipient_mapping(sample))
+        mode_label = "📝 Ручной шаблон (без GPT) — поддерживает плейсхолдеры {name}, {company}, …"
+    else:
+        try:
+            body = await gpt.generate_body(subject=subject, brief=brief, recipient=sample)
+        except Exception as exc:
+            log.exception("GPT preview failed")
+            err_text = (
+                f"❌ GPT вернул ошибку:\n<code>{html.escape(str(exc))}</code>\n\n"
+                "Возможно, OpenAI медленно отвечает или сеть прервалась. Попробуй ещё раз."
+            )
+            if edit:
+                await message.edit_text(err_text, reply_markup=_retry_kb())
+            else:
+                await message.answer(err_text, reply_markup=_retry_kb())
+            return
+        mode_label = "🤖 GPT персонализирует под каждого клиента"
 
     preview_text = (
         "📨 <b>Шаг 4/4 — превью и подтверждение</b>\n\n"
         f"<b>Тема:</b> {html.escape(subject)}\n"
-        f"<b>Получателей:</b> {len(active)}\n"
-        f"<b>Вложений:</b> {len(attachments)}\n"
+        f"<b>Получателей:</b> {total}"
+        + (f" (отписалось: {unsubscribed_count})" if unsubscribed_count else "")
+        + f"\n<b>Вложений:</b> {len(attachments)}\n"
+        f"<b>Режим:</b> {mode_label}\n"
         f"<b>Пример (для {html.escape(sample.name)} &lt;{html.escape(sample.email)}&gt;):</b>\n\n"
-        f"<pre>{html.escape(preview_body)}</pre>\n\n"
-        "Каждому клиенту GPT сгенерирует <i>свой</i> вариант. Отправляем?"
+        f"<pre>{html.escape(body)}</pre>"
     )
+    if note:
+        preview_text += f"\n\n<i>{html.escape(note)}</i>"
 
-    await progress.edit_text(preview_text, reply_markup=_confirm_kb())
+    if edit:
+        await message.edit_text(preview_text, reply_markup=_confirm_kb())
+    else:
+        await message.answer(preview_text, reply_markup=_confirm_kb())
 
 
 @router.callback_query(Campaign.waiting_confirm, F.data == "send:cancel")
@@ -206,6 +256,84 @@ async def confirm_cancel(call: CallbackQuery, state: FSMContext) -> None:
     if call.message:
         await call.message.edit_text("❌ Рассылка отменена. /new чтобы начать заново.")
     await state.clear()
+
+
+@router.callback_query(Campaign.waiting_confirm, F.data == "send:regen")
+async def confirm_regen(
+    call: CallbackQuery,
+    state: FSMContext,
+    gpt: GPTPersonalizer,
+    **_: object,
+) -> None:
+    await call.answer("Перегенерирую…")
+    if call.message is None:
+        return
+    # Сбросим manual_body — regen всегда про GPT.
+    await state.update_data(manual_body=None)
+    await _render_preview(call.message, state, gpt, edit=True, note="Перегенерировано.")
+
+
+@router.callback_query(Campaign.waiting_confirm, F.data == "send:edit_brief")
+async def confirm_edit_brief(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if call.message is None:
+        return
+    await state.set_state(Campaign.editing_brief)
+    await call.message.edit_text(
+        "✏️ <b>Новый бриф для GPT</b>\n\n"
+        "Введи обновлённое описание письма. После — сразу обновлю превью.\n\n"
+        "Чтобы отказаться — /cancel."
+    )
+
+
+@router.message(Campaign.editing_brief, F.text)
+async def edit_brief_apply(
+    message: Message,
+    state: FSMContext,
+    gpt: GPTPersonalizer,
+    **_: object,
+) -> None:
+    new_brief = (message.text or "").strip()
+    if len(new_brief) < 10:
+        await message.answer("Бриф слишком короткий — добавь деталей.")
+        return
+    await state.update_data(brief=new_brief, manual_body=None)
+    await state.set_state(Campaign.waiting_confirm)
+    await _render_preview(message, state, gpt, edit=False, note="Бриф обновлён.")
+
+
+@router.callback_query(Campaign.waiting_confirm, F.data == "send:manual")
+async def confirm_manual(call: CallbackQuery, state: FSMContext) -> None:
+    await call.answer()
+    if call.message is None:
+        return
+    await state.set_state(Campaign.editing_body)
+    await call.message.edit_text(
+        "📝 <b>Свой текст письма</b>\n\n"
+        "Вставь готовое тело письма. GPT вызываться не будет — каждому уйдёт твой текст с подстановкой плейсхолдеров.\n\n"
+        "Поддерживаются плейсхолдеры по колонкам таблицы:\n"
+        "  • <code>{name}</code> — имя клиента\n"
+        "  • <code>{email}</code> — почта\n"
+        "  • <code>{company}</code> и любые другие колонки\n\n"
+        "Если плейсхолдер не найден в таблице — он останется в тексте как есть.\n\n"
+        "Чтобы вернуться к GPT-режиму — /cancel и начни заново /new."
+    )
+
+
+@router.message(Campaign.editing_body, F.text)
+async def edit_body_apply(
+    message: Message,
+    state: FSMContext,
+    gpt: GPTPersonalizer,
+    **_: object,
+) -> None:
+    body = (message.text or "").strip()
+    if len(body) < 20:
+        await message.answer("Текст слишком короткий — пришли полное тело письма.")
+        return
+    await state.update_data(manual_body=body)
+    await state.set_state(Campaign.waiting_confirm)
+    await _render_preview(message, state, gpt, edit=False, note="Загружен ручной шаблон.")
 
 
 @router.callback_query(Campaign.waiting_confirm, F.data == "send:go")
@@ -224,6 +352,7 @@ async def confirm_go(
     data = await state.get_data()
     subject: str = data["subject"]
     brief: str = data["brief"]
+    manual_body: str | None = data.get("manual_body")
     raw_attachments = data.get("attachments", [])
     attachments = [Attachment(filename=a["filename"], path=Path(a["path"])) for a in raw_attachments]
 
@@ -237,7 +366,10 @@ async def confirm_go(
     failed = 0
     for idx, recipient in enumerate(active, start=1):
         try:
-            body = await gpt.generate_body(subject=subject, brief=brief, recipient=recipient)
+            if manual_body is not None:
+                body = _safe_format(manual_body, _recipient_mapping(recipient))
+            else:
+                body = await gpt.generate_body(subject=subject, brief=brief, recipient=recipient)
             await mailer.send(
                 to_email=recipient.email,
                 subject=subject,
@@ -281,13 +413,25 @@ def _attachments_done_kb() -> InlineKeyboardMarkup:
     )
 
 
+def _retry_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="send:regen")],
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="send:cancel")],
+        ]
+    )
+
+
 def _confirm_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Отправить всем", callback_data="send:go")],
             [
-                InlineKeyboardButton(text="🚀 Отправить всем", callback_data="send:go"),
-                InlineKeyboardButton(text="❌ Отменить", callback_data="send:cancel"),
-            ]
+                InlineKeyboardButton(text="🔄 Перегенерировать", callback_data="send:regen"),
+                InlineKeyboardButton(text="✏️ Изменить бриф", callback_data="send:edit_brief"),
+            ],
+            [InlineKeyboardButton(text="📝 Свой текст", callback_data="send:manual")],
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="send:cancel")],
         ]
     )
 
@@ -307,3 +451,23 @@ def _cleanup_attachments(attachments: list[Attachment]) -> None:
             att.path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+
+
+def _safe_format(template: str, mapping: dict[str, str]) -> str:
+    """Substitute {key} placeholders from mapping, leave unknowns intact."""
+
+    def repl(match: re.Match[str]) -> str:
+        key = match.group(1).lower()
+        return mapping.get(key, match.group(0))
+
+    return _PLACEHOLDER_RE.sub(repl, template)
+
+
+def _recipient_mapping(recipient: Recipient) -> dict[str, str]:
+    mapping: dict[str, str] = {"name": recipient.name, "email": recipient.email}
+    for k, v in recipient.extra.items():
+        mapping[k.lower()] = v
+    return mapping

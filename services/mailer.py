@@ -42,6 +42,9 @@ class Mailer:
         msg["From"] = formataddr((self._from_name, self._user)) if self._from_name else self._user
         msg["To"] = to_email
         msg["Subject"] = subject
+        msg["Reply-To"] = self._user
+        msg["List-Unsubscribe"] = f"<mailto:{self._user}?subject=unsubscribe>"
+        msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
         msg.set_content(body)
 
         for att in attachments:

@@ -23,7 +23,8 @@ SYSTEM_PROMPT = """Ты — копирайтер email-рассылок. Теб�
 
 class GPTPersonalizer:
     def __init__(self, api_key: str, model: str) -> None:
-        self._client = AsyncOpenAI(api_key=api_key)
+        # timeout=60s, retries cover transient network blips and OpenAI 5xx/429.
+        self._client = AsyncOpenAI(api_key=api_key, timeout=60.0, max_retries=3)
         self._model = model
 
     async def generate_body(self, *, subject: str, brief: str, recipient: Recipient) -> str:
